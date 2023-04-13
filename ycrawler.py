@@ -1,13 +1,16 @@
+import argparse
 import asyncio
+import collections
 import json
-from asyncio.log import logger
-from pathlib import Path, PurePath
+import logging
+import time
+from hashlib import sha256
+from pathlib import Path
 
 import aiofiles
 import aiohttp
 from aiofiles import os as aios
 from aiofiles import ospath as aiospath
-from aiohttp import ClientHttpProxyError
 from bs4 import BeautifulSoup
 
 #############################################
@@ -21,120 +24,133 @@ nsleep = 30
 store_path = "./downloads"
 proxy = r'http://10.66.2.130:8118/'  # or None
 encoding = 'utf-8'
+
+
 #############################################
-fnmain = 'main.html'
-fncomm = 'comments.html'
 
 
-async def read_url(url):
-    async with aiohttp.ClientSession() as s:
-        try:
-            async with s.get(url, proxy=proxy) as r:
-                # print(r.status)
+async def read_url(url, session, semafor):
+    async with semafor:
+        async with session.get(url, proxy=proxy) as r:
+            try:
                 if r.status == 200:
-                    response = await r.text()
+                    response = await r.read()
+                    content_type = r.content_type
                 else:
-                    response = ''
-                    msg = f'url {url}: status {r.status}'
-                    logger.error(msg)
-                    print(msg)
-        except ClientHttpProxyError as e:
-            logger.error(e)
-            print(e)
-            response = ''
-    return response
+                    response = content_type = None
+                    logging.error(f'Error download url {url}: status {r.status}')
+            except Exception as e:
+                logging.error(e)
+                response = content_type = None
+    return response, content_type
 
 
-async def parse_html(html):
-    """"""
-    bs_obj = BeautifulSoup(html, features="html.parser")
-    return bs_obj
-
-
-async def write_file(fp: Path, html):
+async def write_file(fp: Path, content):
     """"""
     if not await aiospath.exists(fp.parent):
         await aios.makedirs(fp.parent, exist_ok=True)
-    async with aiofiles.open(fp, mode='w', encoding=encoding) as f:
-        await f.write(html)
+    async with aiofiles.open(fp, mode='wb') as f:
+        await f.write(content)
 
 
-async def handle_record(id, record):
+async def handle_record(id, record, session, semafor):
     url = f'{ycomb_url}item?id={id}'
-    record_html = await read_url(url)
-    if not record_html:
+    response, content_type = await read_url(url, session, semafor)
+    # logging.info(f'Item: {url}')
+    if not response:
         return
-    logger.debug('got main page')
     # write record to file
-    fp = PurePath(store_path) / id / 'index.html'
-    await write_file(fp, record_html)
+    fp = Path(store_path) / id / 'index.html'
+    await write_file(fp, response)
 
     a = record.find_all(attrs={'class': 'titleline'})[0].a
     name = a.text.strip()
     href = a['href']
-    logger.info(f'{id}\t{name}\t{href}')
+    logging.info(f'Item: {id}\t{name}\t{href}')
 
-    bs = await parse_html(record_html)
+    bs = BeautifulSoup(response, features="html.parser")
     st = bs.table.find(attrs={'class': 'comment-tree'})
     items = st.find_all('tr', attrs={'class': 'athing'})
 
-    logger.debug(f'{id}\tparsing comments')
     for tr in items:
         comm_id = tr['id']
         commtext = tr.find('span', attrs={'class': 'commtext'})
         if commtext is None:  # no comments
             continue
         comm_urls = [a['href'] for a in commtext.find_all('a') if a]
-        if not comm_urls:  # no links
+        if not comm_urls:  # no links in comment
             continue
-        logger.debug(f'{id}\tparsed comment\'s urls')
-
+        comm_index = collections.defaultdict(list)
+        comm_index_dir = Path(store_path) / id / 'comments'
+        comm_index_file = comm_index_dir / 'index.json'
         for comm_url in comm_urls:
             # download html by comment link
-            fp = Path(store_path) / id / 'comments' / f'{comm_id}.html'.lower()
-            html = await read_url(comm_url)
-            if not html:
-                logger.debug(f'error get data from comment url {comm_url}')
+            response, content_type = await read_url(comm_url, session, semafor)
+            logging.info(f'Comm: {comm_url}')
+            if not response:
+                logging.debug(f'{id}::{comm_id}: error get data from comment url {comm_url}')
+                continue
+            suffix = sha256(time.time_ns().to_bytes(8, 'little')).hexdigest()[:10]
+            if content_type == 'text/html':
+                fname = f'{comm_id}_{suffix}.html'
             else:
-                logger.debug(f'got data from comment url {comm_url}')
+                fname = f'{comm_id}_{suffix}_{Path(comm_url).name.split("?")[0]}'
+            fp = comm_index_dir / fname
+            await write_file(fp, response)
+            comm_index[comm_id].append([fname, comm_url])
+        await write_file(comm_index_file, json.dumps(comm_index).encode(encoding=encoding))
+    return name, url
 
-            await write_file(fp, html)
-            logger.info(f'got {str(fp)}')
 
-
-async def main(parsed):
+async def main(options):
     """"""
-    mpage_html = await read_url(ycomb_url)
-    if not mpage_html:
-        return
-    bs = await parse_html(mpage_html)
-    records = bs.table.find_all(attrs={'class': 'athing'})
-    for record in records:
-        id = record['id']
-        if id in parsed:
-            continue
-        name = await handle_record(id, record)
-        if not name:
-            continue
-        parsed[id] = name
+    semafor = asyncio.Semaphore(options.max_tasks)  # ограничение кол-ва загрузок в одной сессии
+    parsed_fp = Path('parsed.json')
+    try:
+        with parsed_fp.open(encoding=encoding) as fp:
+            parsed = json.loads(fp.read())
+    except Exception:
+        parsed = {}
+
+    # try:
+    while True:
+        async with aiohttp.ClientSession() as session:
+            try:
+                response, _ = await read_url(ycomb_url, session, semafor)
+                logging.info(f'Root: {ycomb_url}')
+                if not response:
+                    break
+                bs = BeautifulSoup(response, features="html.parser")
+                records = bs.table.find_all(attrs={'class': 'athing'})
+                for record in records:
+                    id = record['id']
+                    if id in parsed:  # no repeat
+                        continue
+                    name, url = await handle_record(id, record, session, semafor)
+                    if not name:
+                        continue
+                    parsed[id] = name, url
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                logging.error(f'main: {e}')
+                continue
+            finally:
+                with parsed_fp.open('wt', encoding=encoding) as fp:
+                    json.dump(parsed, fp)
+        logging.info(f'Waiting for {options.period} sec...')
+        await asyncio.sleep(options.period)
+        logging.info('Repeat')
 
 
 if __name__ == '__main__':
-    parsed_fp = Path('parsed.json')
-    if not parsed_fp.exists():
-        parsed = {}
-    else:
-        parsed = json.loads(parsed_fp.read_text(encoding=encoding))
-    # loop = asyncio.get_event_loop()
-    # loop.run_until_complete(main(parsed))
-    try:
-        asyncio.run(main(parsed), debug=True)
-    except Exception as e:
-        print(e)
-        raise
-    # end up
-    with parsed_fp.open('w', encoding=encoding) as fp:
-        json.dump(parsed, fp)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-p', '--period', type=int, default=30, action='store')
+    parser.add_argument('-t', '--max_tasks', type=int, default=5, action='store')
+    parser.add_argument('-d', '--debug', action='store_true')
+    options = parser.parse_args()
+    logging.basicConfig(level=logging.DEBUG if options.debug else logging.INFO)
+    #
+    while True:
+        asyncio.run(main(options))
 
-# @TODO логирование
-# @TODO парсинг имени файла скачанного html из url комментария из url (-http:// и прочее)
